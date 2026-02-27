@@ -14,8 +14,16 @@
 
 from .llama import *
 from ._utils import __version__
-from unsloth_zoo.utils import _get_dtype
+from unsloth_zoo.utils import _get_dtype, Version
 from unsloth_zoo.hf_utils import dtype_from_config
+from ..utils.packing import get_packed_info_from_kwargs
+from ..utils.attention_dispatch import (
+    AttentionConfig,
+    AttentionContext,
+    run_attention,
+    select_attention_backend,
+    SDPA,
+)
 from .gemma import (
     GemmaFixedRotaryEmbedding,
     GemmaFixedLinearScalingRotaryEmbedding,
@@ -33,8 +41,6 @@ try:
         repeat_kv,
     )
 except:
-    from packaging.version import Version
-
     transformers_version = Version(transformers_version)
     if not transformers_version >= Version("4.42"):
         raise ImportError(
@@ -98,19 +104,25 @@ def Gemma2Attention_fast_forward(
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
 
     device_index = Q.device.index
-    if position_ids is None:
-        cos = self.rotary_emb.multi_gpu_cos_cached[device_index]
-        sin = self.rotary_emb.multi_gpu_sin_cached[device_index]
-        Q, K = fast_rope_embedding(Q, K, cos, sin)
+    cos = self.rotary_emb.multi_gpu_cos_cached[device_index]
+    sin = self.rotary_emb.multi_gpu_sin_cached[device_index]
+
+    rope_position_ids = (
+        position_ids if position_ids is not None else kwargs.get("position_ids")
+    )
+    if rope_position_ids is not None:
+        # Useful for LongRoPE
+        cos_var, sin_var = self.rotary_emb.get_cached(kv_seq_len, device_index)
+        Q, K = fast_rope_embedding(Q, K, cos_var, sin_var, rope_position_ids)
     else:
-        cos, sin = self.rotary_emb.get_cached(kv_seq_len, device_index)
-        Q, K = inplace_rope_embedding(Q, K, cos, sin, position_ids)
+        Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
@@ -118,32 +130,68 @@ def Gemma2Attention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Only enable if the attention_mask is True
-    has_sliding_window = type(causal_mask) is bool and causal_mask is True
-    if HAS_FLASH_ATTENTION_SOFTCAPPING and attention_mask is None:
-        window = (-1, -1)
-        if has_sliding_window:
-            sw = getattr(self.config, "sliding_window", None)
-            sw = kv_seq_len if (sw is None or sw == "null") else sw
-            window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
+    use_sliding_window = kwargs.get("use_sliding_window")
+    has_sliding_window = (
+        use_sliding_window
+        if use_sliding_window is not None
+        else isinstance(causal_mask, bool) and causal_mask is True
+    )
 
-        # FA uses 1 / sqrt for softmax_scale!
+    use_flash = HAS_FLASH_ATTENTION_SOFTCAPPING and attention_mask is None
+
+    if use_flash:
+        window = (-1, -1)
+        sliding_window = getattr(self.config, "sliding_window", None)
+        if has_sliding_window:
+            sliding_window = (
+                sliding_window if sliding_window is not None else kv_seq_len
+            )
+            window = (
+                (-1, -1)
+                if kv_seq_len <= sliding_window
+                else (sliding_window, sliding_window)
+            )
+
         if not hasattr(self, "_flash_attention_softmax_scale"):
             self._flash_attention_softmax_scale = 1.0 / (
                 self.config.query_pre_attn_scalar**0.5
             )
 
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        A = flash_attn_func(
-            Q,
-            K,
-            V,
-            causal = True,
-            softcap = self.config.attn_logit_softcapping,
-            softmax_scale = self._flash_attention_softmax_scale,
-            window_size = window,
+        use_varlen = seq_info is not None and past_key_value is None
+
+        attention_config = AttentionConfig(
+            backend = select_attention_backend(use_varlen),
+            n_kv_heads = n_kv_heads,
+            n_groups = n_groups,
+            flash_dense_kwargs = {
+                "causal": True,
+                "softcap": self.config.attn_logit_softcapping,
+                "softmax_scale": self._flash_attention_softmax_scale,
+                "window_size": window,
+            },
+            flash_varlen_kwargs = {
+                "dropout_p": 0.0,
+                "softmax_scale": self._flash_attention_softmax_scale,
+                "causal": True,
+                "softcap": self.config.attn_logit_softcapping,
+                "window_size": window,
+            },
         )
+
+        context = AttentionContext(
+            bsz = bsz,
+            q_len = q_len,
+            kv_seq_len = kv_seq_len,
+            n_heads = n_heads,
+            head_dim = head_dim,
+            requires_grad = hidden_states.requires_grad,
+            seq_info = seq_info,
+            attention_mask = attention_mask,
+            causal_mask = causal_mask,
+            sliding_window = sliding_window,
+        )
+
+        A = run_attention(config = attention_config, context = context, Q = Q, K = K, V = V)
         A = A.reshape(bsz, q_len, n_heads * head_dim)
     else:
         fx = (
@@ -174,7 +222,9 @@ def Gemma2DecoderLayer_fast_forward(
         self, "_flag_for_generation"
     ):  # past_key_value is not None:
         out_weight = torch.empty(
-            self.input_layernorm.weight.shape, dtype = torch.float32, device = "cuda:0"
+            self.input_layernorm.weight.shape,
+            dtype = torch.float32,
+            device = f"{DEVICE_TYPE_TORCH}:0",
         )
 
         # Self Attention
@@ -192,6 +242,7 @@ def Gemma2DecoderLayer_fast_forward(
             use_cache = use_cache,
             padding_mask = padding_mask,
             _flag_for_generation = self._flag_for_generation,
+            **kwargs,
         )
         hidden_states = fast_rms_layernorm_inference_gemma(
             self.post_attention_layernorm, hidden_states, out_weight
@@ -222,6 +273,7 @@ def Gemma2DecoderLayer_fast_forward(
             output_attentions = output_attentions,
             use_cache = use_cache,
             padding_mask = padding_mask,
+            **kwargs,
         )
         hidden_states = fast_rms_layernorm(
             self.post_attention_layernorm, hidden_states, gemma = True
@@ -263,6 +315,7 @@ def Gemma2Attention_fast_forward_inference(
     do_prefill = False,
     attention_mask = None,
     use_sliding_window = False,
+    **kwargs,
 ):
     Xn = hidden_states
     bsz, _, hd = hidden_states.size()
@@ -301,7 +354,7 @@ def Gemma2Attention_fast_forward_inference(
         )
         self.RH_Q = torch.empty((bsz, n_heads, 1, head_dim), dtype = dtype, device = device)
         # Only for Gemma2
-        self.temp_O = torch.empty((1, bsz, hidden_size), dtype = dtype, device = device)
+        self.temp_O = torch.empty((bsz, 1, hidden_size), dtype = dtype, device = device)
         self.attention = torch.empty(
             (bsz, n_heads, 1, KV_CACHE_INCREMENT + seq_len), dtype = dtype, device = device
         )
@@ -348,7 +401,7 @@ def Gemma2Attention_fast_forward_inference(
     RH_Q = self.RH_Q
     RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
     RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
-    torch.neg(RH_Q[:, :, :, :h], out = RH_Q[:, :, :, :h])
+    RH_Q[:, :, :, :h].neg_()
     Qn *= cos
     Qn.addcmul_(RH_Q, sin)
 
@@ -357,7 +410,7 @@ def Gemma2Attention_fast_forward_inference(
     ]  # torch.empty((n_kv_heads, 1, head_dim), dtype = dtype, device = "cuda:0")
     RH_K[:, :, :, :h] = Kn[:, :, :, h:]
     RH_K[:, :, :, h:] = Kn[:, :, :, :h]
-    torch.neg(RH_K[:, :, :, :h], out = RH_K[:, :, :, :h])
+    RH_K[:, :, :, :h].neg_()
     Kn *= cos
     Kn.addcmul_(RH_K, sin)
 
@@ -372,10 +425,9 @@ def Gemma2Attention_fast_forward_inference(
     # Handle sliding windows
     sliding_window = self.config.sliding_window
     if use_sliding_window and kv_seq_len > sliding_window:
-        # From https://github.com/huggingface/transformers/blob/main/src/transformers/models/mistral/modeling_mistral.py#L193
-        slicing_tokens = 1 - sliding_window
-        Knn = Kn[:, :, slicing_tokens:, :]  # .contiguous()
-        Vnn = Vn[:, :, slicing_tokens:, :]  # .contiguous()
+        start = kv_seq_len - sliding_window
+        Knn = Kn[:, :, start:, :]  # .contiguous()
+        Vnn = Vn[:, :, start:, :]  # .contiguous()
     else:
         Knn, Vnn = Kn, Vn
 
@@ -390,28 +442,32 @@ def Gemma2Attention_fast_forward_inference(
         )
         Knn = Knn.reshape(bsz, n_heads, cached_len, head_dim)
         Vnn = Vnn.reshape(bsz, n_heads, cached_len, head_dim)
-    # else:
-    #     Knn, Vnn = Knn, Vnn
-    # pass
 
     # Attention
-    # if bsz == 1:
+    # [TODO] Gemma2 uses manual matmul for all batch sizes because SDPA does
+    # not support softcapping (tanh logit scaling). If a future PyTorch adds
+    # a softcap param to scaled_dot_product_attention, consider using SDPA
+    # for bsz > 1 to match the llama/qwen3 pattern.
     Qn *= (
         self.scalar
     )  # See https://github.com/ggerganov/llama.cpp/issues/7805#issuecomment-2153349963
     # It seems like doing (Q * scalar) @ K is better than (Q @ K) * scalar to stop overflows
     A = torch_matmul(Qn, Knn.transpose(2, 3), out = self.attention[:, :, :, :cached_len])
-    # if attention_mask is not None: A += attention_mask # Must add attention_mask for batched
 
+    # Softcapping must happen BEFORE the mask is applied.
+    # Reference: google-deepmind/gemma _modules.py and transformers gemma2 eager_attention_forward
     A *= self.reciprocal_t
-    torch_tanh(A, out = A)
+    A.tanh_()
     A *= self.t  # Logit softcapping
+
+    if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
+        # Slice mask to match K/V when sliding window is active
+        if attention_mask.shape[-1] != A.shape[-1]:
+            attention_mask = attention_mask[:, :, :, -A.shape[-1] :]
+        A += attention_mask
 
     A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)  # .to(A.dtype)
     A = torch_matmul(A, Vnn, out = Qn)
-    # else:
-    #     A = scaled_dot_product_attention(Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = False)
-    # pass
     A = A.transpose(1, 2)
     A = A.reshape(bsz, 1, attention_size)
     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)
@@ -426,6 +482,7 @@ def Gemma2Model_fast_forward_inference(
     past_key_values,
     position_ids,
     attention_mask = None,
+    **kwargs,
 ):
     out_weights = tuple(
         torch.empty_like(
@@ -550,7 +607,7 @@ class FastGemma2Model(FastLlamaModel):
 
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
-        # Inferene can now be CUDAGraphed, but we shall retain the old rotary embeddings.
+        # Inference can now be CUDAGraphed, but we shall retain the old rotary embeddings.
         # https://github.com/huggingface/transformers/pull/27931
         # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py
         import transformers.models.gemma2.modeling_gemma2
@@ -561,10 +618,10 @@ class FastGemma2Model(FastLlamaModel):
         return
 
     @staticmethod
-    def post_patch(model, tokenizer):
+    def post_patch(model, tokenizer, correct_dtype = None):
         # Gemma does not downcast RoPE
         model, tokenizer = patch_model_and_tokenizer(
-            model, tokenizer, downcast_rope = False
+            model, tokenizer, downcast_rope = False, correct_dtype = correct_dtype
         )
 
         # Add 1 to weight

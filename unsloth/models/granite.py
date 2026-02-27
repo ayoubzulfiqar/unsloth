@@ -15,8 +15,16 @@
 from .llama import *
 import os
 from ._utils import __version__
-from unsloth_zoo.utils import _get_dtype
+from unsloth_zoo.utils import _get_dtype, Version
 from unsloth_zoo.hf_utils import dtype_from_config
+from ..utils.packing import get_packed_info_from_kwargs
+from ..utils.attention_dispatch import (
+    AttentionConfig,
+    AttentionContext,
+    run_attention,
+    select_attention_backend,
+    SDPA,
+)
 from .llama import (
     LlamaRotaryEmbedding,
     LlamaLinearScalingRotaryEmbedding,
@@ -33,14 +41,12 @@ try:
         GraniteForCausalLM,
     )
 except:
-    from packaging.version import Version
-
     transformers_version = Version(transformers_version)
     if not transformers_version >= Version("4.45.0"):
         raise ImportError(
-            f"Unsloth: Your transformers version of {transformers_version} does not support Gemma2.\n"
-            f"The minimum required version is 4.42.3.\n"
-            f'Try `pip install --upgrade "transformers>=4.42.3"`\n'
+            f"Unsloth: Your transformers version of {transformers_version} does not support Granite.\n"
+            f"The minimum required version is 4.45.0.\n"
+            f'Try `pip install --upgrade "transformers>=4.45.0"`\n'
             f"to obtain the latest transformers build, then restart this session."
         )
 
@@ -96,6 +102,7 @@ def GraniteAttention_fast_forward(
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
@@ -103,10 +110,14 @@ def GraniteAttention_fast_forward(
 
     assert position_embeddings is not None
     cos, sin = position_embeddings
-    if position_ids is None:
-        Q, K = fast_rope_embedding(Q, K, cos, sin)
+    rope_position_ids = (
+        position_ids if position_ids is not None else kwargs.get("position_ids")
+    )
+    if rope_position_ids is not None:
+        # Useful for LongRoPE
+        Q, K = fast_rope_embedding(Q, K, cos, sin, rope_position_ids)
     else:
-        Q, K = inplace_rope_embedding(Q, K, cos, sin, position_ids)
+        Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
@@ -114,69 +125,59 @@ def GraniteAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    if not HAS_FLASH_ATTENTION and HAS_XFORMERS and attention_mask is None:
-        # Xformers memory efficient attention
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        K_M = V_M = bsz * kv_seq_len
-        Q_M = bsz * q_len
+    use_varlen = (
+        attention_mask is None and seq_info is not None and past_key_value is None
+    )
 
-        # Group query attention
-        K = K.view(bsz, kv_seq_len, n_kv_heads, 1, head_dim)
-        V = V.view(bsz, kv_seq_len, n_kv_heads, 1, head_dim)
-        K = K.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        V = V.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        if hidden_states.requires_grad:
-            K = K.reshape(bsz, kv_seq_len, n_heads, head_dim)
-            V = V.reshape(bsz, kv_seq_len, n_heads, head_dim)
-        else:
-            # Xformers does support the forward pass though
-            Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
+    backend = (
+        SDPA if attention_mask is not None else select_attention_backend(use_varlen)
+    )
 
-        A = xformers_attention(
-            Q, K, V, attn_bias = causal_mask, scale = self.scaling, p = dropout_p
-        )
-        A = A.view(bsz, q_len, n_heads, head_dim)
+    window = (kv_seq_len, kv_seq_len)
+    softmax_scale = getattr(self, "scaling", None)
+    attention_config = AttentionConfig(
+        backend = backend,
+        n_kv_heads = n_kv_heads,
+        n_groups = n_groups,
+        flash_dense_kwargs = {
+            "causal": True,
+            "softmax_scale": softmax_scale,
+            "dropout_p": dropout_p,
+            "window_size": window,
+        },
+        flash_varlen_kwargs = {
+            "dropout_p": 0.0,
+            "softmax_scale": softmax_scale,
+            "causal": True,
+        },
+        sdpa_kwargs = {
+            k: v
+            for k, v in {
+                "attn_mask": attention_mask,
+                "scale": softmax_scale,
+                "dropout_p": dropout_p,
+            }.items()
+            if v is not None
+        },
+        xformers_kwargs = {
+            "scale": softmax_scale,
+            "p": dropout_p,
+        },
+    )
 
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        window = (kv_seq_len, kv_seq_len)
-        A = flash_attn_func(
-            Q,
-            K,
-            V,
-            causal = True,
-            window_size = window,
-            softmax_scale = self.scaling,
-            dropout_p = dropout_p,
-        )
-    else:
-        # Grouped query attention
-        # if n_groups != 1:
-        K = K[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        V = V[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        K = K.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        V = V.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        # pass
-        # Must be contiguous or else results are False!
-        # https://github.com/pytorch/pytorch/issues/112577
-        Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-        # Needs (batch_size, n_heads, seq_len, head_dim)
-        # is_casual and attention_mask must not be both set!
-        A = scaled_dot_product_attention(
-            Q,
-            K,
-            V,
-            attn_mask = attention_mask,
-            scale = self.scaling,
-            is_causal = False,
-            dropout_p = dropout_p,
-        )
-        # Go back to (batch_size, seq_len, n_heads, head_dim)
-        A = A.transpose(1, 2).contiguous()
+    context = AttentionContext(
+        bsz = bsz,
+        q_len = q_len,
+        kv_seq_len = kv_seq_len,
+        n_heads = n_heads,
+        head_dim = head_dim,
+        requires_grad = hidden_states.requires_grad,
+        seq_info = seq_info,
+        attention_mask = attention_mask,
+        causal_mask = causal_mask,
+    )
+
+    A = run_attention(config = attention_config, context = context, Q = Q, K = K, V = V)
 
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
@@ -222,6 +223,7 @@ def GraniteDecoderLayer_fast_forward(
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
             _flag_for_generation = self._flag_for_generation,
+            **kwargs,
         )
         hidden_states = torch.add(residual, hidden_states, alpha = residual_multiplier)
 
@@ -245,6 +247,7 @@ def GraniteDecoderLayer_fast_forward(
             use_cache = use_cache,
             padding_mask = padding_mask,
             position_embeddings = position_embeddings,
+            **kwargs,
         )
         hidden_states = torch.add(residual, hidden_states, alpha = residual_multiplier)
 
@@ -320,8 +323,7 @@ def GraniteAttention_fast_forward_inference(
             (2, bsz, 1, n_kv_heads * head_dim), dtype = dtype, device = device
         )
         self.RH_Q = torch.empty((bsz, n_heads, 1, head_dim), dtype = dtype, device = device)
-        # Only for Gemma2
-        self.temp_O = torch.empty((1, bsz, hidden_size), dtype = dtype, device = device)
+        self.temp_O = torch.empty((bsz, 1, hidden_size), dtype = dtype, device = device)
         self.attention = torch.empty(
             (bsz, n_heads, 1, KV_CACHE_INCREMENT + seq_len), dtype = dtype, device = device
         )
@@ -359,7 +361,7 @@ def GraniteAttention_fast_forward_inference(
     RH_Q = self.RH_Q
     RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
     RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
-    torch.neg(RH_Q[:, :, :, :h], out = RH_Q[:, :, :, :h])
+    RH_Q[:, :, :, :h].neg_()
     Qn *= cos
     Qn.addcmul_(RH_Q, sin)
 
@@ -368,7 +370,7 @@ def GraniteAttention_fast_forward_inference(
     ]  # torch.empty((n_kv_heads, 1, head_dim), dtype = dtype, device = "cuda:0")
     RH_K[:, :, :, :h] = Kn[:, :, :, h:]
     RH_K[:, :, :, h:] = Kn[:, :, :, :h]
-    torch.neg(RH_K[:, :, :, :h], out = RH_K[:, :, :, :h])
+    RH_K[:, :, :, :h].neg_()
     Kn *= cos
     Kn.addcmul_(RH_K, sin)
 
@@ -382,7 +384,7 @@ def GraniteAttention_fast_forward_inference(
 
     # Grouped query attention
     _, _, cached_len, _ = Kn.shape
-    if n_groups != 1:
+    if bsz == 1 or ((not SDPA_HAS_GQA) and n_groups != 1):
         Kn = Kn[:, :, None, :, :].expand(
             bsz, n_kv_heads, n_groups, cached_len, head_dim
         )
@@ -391,20 +393,39 @@ def GraniteAttention_fast_forward_inference(
         )
         Kn = Kn.reshape(bsz, n_heads, cached_len, head_dim)
         Vn = Vn.reshape(bsz, n_heads, cached_len, head_dim)
-    # else:
-    #     Kn, Vn = Kn, Vn
-    # pass
 
-    Qn *= self.scaling
-    A = torch_matmul(Qn, Kn.transpose(2, 3), out = self.attention[:, :, :, :cached_len])
-
-    # if attention_mask is not None: A += attention_mask # Must add attention_mask for batched
-
-    A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)  # .to(A.dtype)
-    A = torch_matmul(A, Vn, out = Qn)
-    # else:
-    #     A = scaled_dot_product_attention(Qn, Kn, Vn, attn_mask = attention_mask, is_causal = False)
-    # pass
+    # Attention
+    if bsz == 1:
+        Qn *= self.scaling
+        A = torch_matmul(
+            Qn, Kn.transpose(2, 3), out = self.attention[:, :, :, :cached_len]
+        )
+        A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)
+        A = torch_matmul(A, Vn, out = Qn)
+    else:
+        if (
+            attention_mask is not None
+            and attention_mask.dim() == 4
+            and attention_mask.dtype != torch.bool
+        ):
+            attention_mask = attention_mask.eq(0)
+        if SDPA_HAS_GQA:
+            A = scaled_dot_product_attention(
+                Qn,
+                Kn,
+                Vn,
+                attn_mask = attention_mask,
+                scale = self.scaling,
+                enable_gqa = True,
+            )
+        else:
+            A = scaled_dot_product_attention(
+                Qn,
+                Kn,
+                Vn,
+                attn_mask = attention_mask,
+                scale = self.scaling,
+            )
     A = A.transpose(1, 2)
     A = A.reshape(bsz, 1, attention_size)
     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)
@@ -439,6 +460,9 @@ def GraniteModel_fast_forward_inference(
             hidden_states,
             seq_len,
         )
+        # Pre-convert to bool once for all layers (avoids per-layer .eq(0))
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            attention_mask = attention_mask.eq(0)
     else:
         attention_mask = None
 
@@ -539,7 +563,7 @@ class FastGraniteModel(FastLlamaModel):
         return
 
     @staticmethod
-    def post_patch(model, tokenizer):
+    def post_patch(model, tokenizer, correct_dtype = None):
         # Torch.compile fails on embedding matrix??
         # Workaround randomnly fixes it for torch versions < 2.2
         model.model.embed_tokens = torch.nn.Embedding.from_pretrained(

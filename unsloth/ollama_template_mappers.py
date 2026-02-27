@@ -806,7 +806,7 @@ TEMPLATE """<|system|>
 PARAMETER stop "<|system|>"
 PARAMETER stop "<|user|>"
 PARAMETER stop "<|assistant|>"
-PARAMETER "</s>"
+PARAMETER stop "</s>"
 SYSTEM """You are a helpful AI assistant."""
 '''
 
@@ -974,6 +974,7 @@ TEMPLATE """{{- range $i, $_ := .Messages }}
 
 
 OLLAMA_TEMPLATES["qwen-25"] = qwen25_ollama
+OLLAMA_TEMPLATES["qwen-2.5"] = qwen25_ollama
 OLLAMA_TEMPLATES["qwen-25-coder"] = qwen_25_coder_ollama
 OLLAMA_TEMPLATES["qwen-25-vl"] = qwen_25_vl_ollama
 OLLAMA_TEMPLATES["openthinker"] = openthinker_ollama
@@ -1520,7 +1521,7 @@ Loop over messages and look for a user-provided system message and documents
 
     {{- /*
     NOTE: Since Ollama collates consecutive roles, for control and documents, we
-        work around this by allowing the role to contain an qualifier after the
+        work around this by allowing the role to contain a qualifier after the
         role string.
     */ -}}
 

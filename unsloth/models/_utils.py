@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2025.11.2"
+__version__ = "2026.2.1"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -28,6 +28,7 @@ __all__ = [
     "HAS_FLASH_ATTENTION_SOFTCAPPING",
     "USE_MODELSCOPE",
     "platform_system",
+    "resolve_hip_gpu_stats_name",
     "patch_tokenizer",
     "get_statistics",
     "Unsloth_Offloaded_Gradient_Checkpointer",
@@ -59,9 +60,11 @@ __all__ = [
     "unsloth_fused_ce_loss",
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
+    "apply_unsloth_gradient_checkpointing",
     "patch_compiled_autograd",
     "process_vision_info",
     "unsloth_compile_transformers",
+    "prefer_flex_attn_if_supported",
     "patch_fast_lora",
     "validate_loftq_config",
     "RaiseUninitialized",
@@ -71,10 +74,16 @@ __all__ = [
     "dequantize_module_weight",
     "patch_hf_quantizer",
     "verify_fp8_support_if_applicable",
+    "_redirect_fp8_to_bf16",
+    "_get_inference_mode_context_manager",
+    "hf_login",
+    "is_moe_model",
+    "get_moe_target_parameters",
+    "make_fast_generate_wrapper",
 ]
 
 import torch
-from typing import Union, Optional, List, Any, Callable, Tuple
+from typing import Union, Optional, List, Any, Callable, Tuple, Iterator
 from platform import system as platform_system
 
 platform_system = platform_system()
@@ -83,7 +92,9 @@ import contextlib
 import re
 from dataclasses import dataclass, field
 import functools
-import warnings, subprocess, re, inspect, psutil, os, math
+import textwrap
+import logging
+import warnings, subprocess, inspect, psutil, os, math
 from unsloth_zoo.utils import Version, get_quant_type
 from importlib.metadata import version as importlib_version
 from ..device_type import (
@@ -94,6 +105,7 @@ from ..device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
+from ..import_fixes import UNSLOTH_ENABLE_LOGGING
 from unsloth_zoo.log import logger
 from unsloth_zoo.tokenizer_utils import (
     patch_tokenizer as _patch_tokenizer,
@@ -139,9 +151,109 @@ from unsloth_zoo.compiler import (
 from unsloth_zoo.training_utils import (
     prepare_model_for_training,
 )
+
+
+def resolve_hip_gpu_stats_name(gpu_stats):
+    name = str(getattr(gpu_stats, "name", "") or "").strip()
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+    normalized_name = name.lower().strip(". ")
+    if normalized_name and normalized_name not in ("amd radeon graphics",):
+        return name + ". "
+
+    try:
+        torch_name = str(torch.cuda.get_device_name(0) or "").strip()
+        torch_name = re.sub(r"\s*\([^)]*\)\s*$", "", torch_name).strip()
+    except Exception:
+        torch_name = ""
+    normalized_torch_name = torch_name.lower().strip(". ")
+    if normalized_torch_name and normalized_torch_name not in ("amd radeon graphics",):
+        return torch_name + ". "
+
+    arch_name = ""
+    for key in ("gcnArchName", "gcn_arch_name", "arch_name", "gfx_arch_name"):
+        value = getattr(gpu_stats, key, None)
+        if value is not None and str(value).strip():
+            arch_name = str(value).strip()
+            break
+
+    if arch_name:
+        arch_name = arch_name.strip()
+        match = re.search(r"(gfx[0-9a-z]+)", arch_name, flags = re.I)
+        if match:
+            return f"AMD {match.group(1).lower()} GPU. "
+    return "AMD GPU. "
+
+
 from unsloth_zoo.temporary_patches import (
     TEMPORARY_PATCHES,
 )
+
+
+def apply_unsloth_gradient_checkpointing(
+    use_gradient_checkpointing, max_seq_length, dtype
+):
+    """
+    Apply gradient checkpointing with smart heuristics.
+
+    For seq < 512, the overhead of gradient offloading in gc="unsloth" mode
+    is not worth it. Benchmarks show standard gc is faster for small sequences.
+
+    Args:
+        use_gradient_checkpointing: "unsloth", True, False, or None
+        max_seq_length: The maximum sequence length
+        dtype: The model dtype for patching
+
+    Returns:
+        The effective use_gradient_checkpointing value (may change from "unsloth" to True)
+    """
+    if use_gradient_checkpointing == "unsloth":
+        # Gradient offloading overhead is not worth it for small sequences.
+        # Benchmarks show crossover point is around seq_len 384-512.
+        # For seq < 512, standard gradient checkpointing is faster.
+        if max_seq_length < 512:
+            unpatch_unsloth_smart_gradient_checkpointing()
+            return True
+        else:
+            patch_unsloth_smart_gradient_checkpointing(dtype = dtype)
+            return "unsloth"
+    elif use_gradient_checkpointing in (True, False):
+        # User explicitly set True or False - unpatch any previous "unsloth" patching
+        unpatch_unsloth_smart_gradient_checkpointing()
+        return use_gradient_checkpointing
+    return use_gradient_checkpointing
+
+
+def prefer_flex_attn_if_supported(model_class, config):
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0":
+        return None
+    try:
+        from transformers.utils.import_utils import is_torch_flex_attn_available
+
+        if not is_torch_flex_attn_available():
+            return None
+        if model_class is None or not getattr(
+            model_class, "_supports_flex_attn", False
+        ):
+            return None
+        # GPT-OSS, Mllama and Gemma3N use eager/sdpa attention during
+        # inference since flex attention returns incorrect results or errors out.
+        # GPT-OSS: left padding issues cause incorrect outputs.
+        # Mllama: _update_causal_mask uses make_flex_block_causal_mask which
+        # creates BlockMask with Q_LEN=KV_LEN=total_seq_len, but during
+        # decode q_len=1, causing ValueError. Needs transformers update.
+        # Gemma3N: timm vision wrappers (eg Gemma3nVisionConfig) do not
+        # support flex_attention.
+        model_type = getattr(config, "model_type", "") if config else ""
+        if model_type in ("gpt_oss", "mllama") or str(model_type).startswith("gemma3n"):
+            return None
+        if config is not None:
+            setattr(config, "_attn_implementation", "flex_attention")
+            if hasattr(config, "attn_implementation"):
+                setattr(config, "attn_implementation", "flex_attention")
+        return "flex_attention"
+    except Exception:
+        return None
+
 
 for temporary_patch in TEMPORARY_PATCHES:
     temporary_patch()
@@ -165,10 +277,12 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings(action = "ignore", category = RuntimeWarning, module = "multiprocess")
 warnings.filterwarnings(action = "ignore", category = UserWarning, module = "triton")
-# Stop "Special tokens have been added in the vocabulary, ..."
-import logging
+warnings.filterwarnings(action = "ignore", category = UserWarning, module = "bitsandbytes")
 
+# Stop "Special tokens have been added in the vocabulary, ..."
 logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.CRITICAL + 1)
+
+TORCHAO_MSG = "Error: torchao not found, please install with `pip install torchao`"
 
 
 # Ignore logging messages
@@ -182,8 +296,45 @@ class HideLoggingMessage(logging.Filter):
         return not (self.text in x.getMessage())
 
 
+# Replace warning messages (analogous to HideLoggingMessage but for warnings.warn)
+class ReplaceWarningMessage:
+    """
+    Intercepts warnings.warn calls and replaces matching messages with Unsloth branded ones.
+    Uses a list of registered (match_text, replacement, category) rules checked in order.
+    """
+
+    _rules = []
+    _original_showwarning = None
+    _installed = False
+
+    @classmethod
+    def add_rule(cls, match_text, replacement, category = None):
+        cls._rules.append((match_text, replacement, category))
+        if not cls._installed:
+            cls._install()
+
+    @classmethod
+    def _install(cls):
+        cls._original_showwarning = warnings.showwarning
+        cls._installed = True
+
+        def _patched_showwarning(
+            message, category, filename, lineno, file = None, line = None
+        ):
+            msg_str = str(message)
+            for match_text, replacement, match_category in cls._rules:
+                if match_text in msg_str and (
+                    match_category is None or category is match_category
+                ):
+                    print(replacement)
+                    return
+            cls._original_showwarning(message, category, filename, lineno, file, line)
+
+        warnings.showwarning = _patched_showwarning
+
+
 # Stop vLLM messages
-if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") != "1":
+if not UNSLOTH_ENABLE_LOGGING:
     try:
         from vllm.worker.worker import logger as vllm_worker_logger
 
@@ -205,6 +356,17 @@ if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") != "1":
         vllm_executor_logger.addFilter(HideLoggingMessage("to wake up"))
         vllm_executor_logger.addFilter(HideLoggingMessage("Executor is not sleeping"))
         del vllm_executor_logger
+    except:
+        pass
+    try:
+        from vllm.v1.executor.abstract import logger as vllm_v1_executor_logger
+
+        vllm_v1_executor_logger.addFilter(HideLoggingMessage("to fall asleep"))
+        vllm_v1_executor_logger.addFilter(HideLoggingMessage("to wake up"))
+        vllm_v1_executor_logger.addFilter(
+            HideLoggingMessage("Executor is not sleeping")
+        )
+        del vllm_v1_executor_logger
     except:
         pass
     try:
@@ -446,6 +608,36 @@ class RaiseUninitialized:
         transformers_logger.removeHandler(self.error_handler)
 
 
+try:
+    from transformers.trainer import logger as transformers_trainer_logger
+
+    transformers_trainer_logger.addFilter(
+        HideLoggingMessage("The model is already on multiple devices.")
+    )
+except:
+    pass
+
+# Hide HF Hub unauthenticated request warnings
+try:
+    from huggingface_hub.utils._http import logger as hf_http_logger
+
+    hf_http_logger.addFilter(
+        HideLoggingMessage("You are sending unauthenticated requests")
+    )
+    del hf_http_logger
+except:
+    pass
+
+# Replace PEFT target_parameters warning with Unsloth branded message for MoE models
+ReplaceWarningMessage.add_rule(
+    match_text = "target_parameters",
+    replacement = (
+        "Unsloth: PEFT set target_parameters but found no matching parameters.\n"
+        "This is expected for MoE models - Unsloth handles MoE expert LoRA targeting separately."
+    ),
+    category = RuntimeWarning,
+)
+
 # Patch get_model_param_count to record correct 4bit / 8bit
 from transformers.trainer_pt_utils import is_deepspeed_zero3_enabled
 
@@ -528,6 +720,12 @@ try:
     from transformers.configuration_utils import layer_type_validation
 except:
     pass
+
+try:
+    # Transformers 5.0+ uses RotaryEmbeddingConfigMixin as a base class for configs
+    from transformers.modeling_rope_utils import RotaryEmbeddingConfigMixin
+except:
+    pass
 from transformers import __version__ as transformers_version
 
 try:
@@ -560,6 +758,12 @@ for model_name in model_architectures:
         config = inspect.getsource(eval(config_filename))
     except:
         continue
+    if "RopeParameters" in config:
+        try:
+            exec(f"from {config_filepath} import RopeParameters", globals())
+        except:
+            continue
+
     if "rope_scaling" in config:
         continue
     config = re.sub(
@@ -678,11 +882,8 @@ if DEVICE_TYPE == "cuda":
                     )
             except:
                 print(
-                    "Unsloth: Your Flash Attention 2 installation seems to be broken?\n"
-                    "A possible explanation is you have a new CUDA version which isn't\n"
-                    "yet compatible with FA2? Please file a ticket to Unsloth or FA2.\n"
-                    "We shall now use Xformers instead, which does not have any performance hits!\n"
-                    "We found this negligible impact by benchmarking on 1x A100."
+                    "Unsloth: Your Flash Attention 2 installation seems to be broken. "
+                    "Using Xformers instead. No performance changes will be seen."
                 )
 
                 # Stop Flash Attention from importing!
@@ -730,11 +931,8 @@ elif DEVICE_TYPE == "hip":
                 )
         except:
             print(
-                "Unsloth: Your Flash Attention 2 installation seems to be broken?\n"
-                "A possible explanation is you have a new CUDA version which isn't\n"
-                "yet compatible with FA2? Please file a ticket to Unsloth or FA2.\n"
-                "We shall now use Xformers instead, which does not have any performance hits!\n"
-                "We found this negligible impact by benchmarking on 1x A100."
+                "Unsloth: Your Flash Attention 2 installation seems to be broken. "
+                "Using Xformers instead. No performance changes will be seen."
             )
 
             # Stop Flash Attention from importing!
@@ -753,6 +951,13 @@ elif DEVICE_TYPE == "xpu":
 
 # =============================================
 # Get Xformers
+# Silence xformers CUDA mismatch warnings before import
+try:
+    _xformers_logger = logging.getLogger("xformers")
+    _xformers_logger.setLevel(logging.ERROR)
+    del _xformers_logger
+except:
+    pass
 try:
     from xformers import __version__ as xformers_version
 
@@ -827,10 +1032,11 @@ except ModuleNotFoundError:
     xformers_attention = None
     xformers_version = None
 except Exception as e:
-    print(
-        "========\nSwitching to PyTorch attention since your Xformers is broken.\n========\n"
-    )
-    print(str(e))
+    if UNSLOTH_ENABLE_LOGGING:
+        print(
+            "========\nSwitching to PyTorch attention since your Xformers is broken.\n========\n"
+        )
+        print(str(e))
     xformers = None
     xformers_attention = None
     xformers_version = None
@@ -1067,8 +1273,12 @@ def has_internet(host = "8.8.8.8", port = 53, timeout = 3):
         return False
     try:
         socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-        return True
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((host, port))
+            return True
+        finally:
+            sock.close()
     except socket.error as ex:
         return False
 
@@ -1087,53 +1297,66 @@ def _get_statistics(statistics = None, force_download = True):
     global USE_MODELSCOPE
     USE_MODELSCOPE = os.environ.get("UNSLOTH_USE_MODELSCOPE", "0") == "1"
 
-    if statistics is not None:
-        pass
-    elif "\nCOLAB_" in keynames and n_cpus == 1:
-        statistics = "colab"
-    elif "\nCOLAB_" in keynames:
-        statistics = "colabpro"
-    elif "\nKAGGLE_" in keynames:
-        statistics = "kaggle"
-    elif "\nRUNPOD_" in keynames:
-        statistics = "runpod"
-    elif "\nAWS_" in keynames:
-        statistics = "aws"
-    elif "\nAZURE_" in keynames:
-        statistics = "azure"
-    # elif "\nK_" in keynames or "\nFUNCTION_" in keynames: statistics = "gcp"
-    elif "\nINVOCATION_ID" in keynames:
-        statistics = "lambda"
-    # else: statistics = "other"
-    else:
-
-        def try_vllm_check():
-            vendor_files = (
-                "/sys/class/dmi/id/product_version",
-                "/sys/class/dmi/id/bios_vendor",
-                "/sys/class/dmi/id/product_name",
-                "/sys/class/dmi/id/chassis_asset_tag",
-                "/sys/class/dmi/id/sys_vendor",
-            )
+    if statistics is None:
+        # Prefer filesystem markers (harder to misidentify) before env-key matching
+        try:
             from pathlib import Path
 
-            for vendor_file in vendor_files:
-                path = Path(vendor_file)
-                if path.is_file():
-                    file_content = path.read_text().lower()
-                    if "amazon" in file_content:
-                        return "aws"
-                    elif "microsoft corporation" in file_content:
-                        return "azure"
-                    elif "google" in file_content:
-                        return "gcp"
-            return "other"
+            if Path("/kaggle/working").exists():
+                statistics = "kaggle"
+            elif Path("/content").exists() and Path("/opt/colab").exists():
+                statistics = "colab" if n_cpus == 1 else "colabpro"
+            elif Path("/runpod-volume").exists():
+                statistics = "runpod"
+        except Exception:
+            pass
 
-        pass
-        try:
-            statistics = try_vllm_check()
-        except:
-            statistics = "other"
+        # Fallback to env-key detection
+        if statistics is None:
+            if "\nKAGGLE_" in keynames:
+                statistics = "kaggle"
+            elif "\nCOLAB_" in keynames and n_cpus == 1:
+                statistics = "colab"
+            elif "\nCOLAB_" in keynames:
+                statistics = "colabpro"
+            elif "\nRUNPOD_" in keynames:
+                statistics = "runpod"
+            elif "\nAWS_" in keynames:
+                statistics = "aws"
+            elif "\nAZURE_" in keynames:
+                statistics = "azure"
+            # elif "\nK_" in keynames or "\nFUNCTION_" in keynames: statistics = "gcp"
+            elif "\nINVOCATION_ID" in keynames:
+                statistics = "lambda"
+            # else: statistics = "other"
+            else:
+
+                def try_vllm_check():
+                    vendor_files = (
+                        "/sys/class/dmi/id/product_version",
+                        "/sys/class/dmi/id/bios_vendor",
+                        "/sys/class/dmi/id/product_name",
+                        "/sys/class/dmi/id/chassis_asset_tag",
+                        "/sys/class/dmi/id/sys_vendor",
+                    )
+
+                    for vendor_file in vendor_files:
+                        path = Path(vendor_file)
+                        if path.is_file():
+                            file_content = path.read_text().lower()
+                            if "amazon" in file_content:
+                                return "aws"
+                            elif "microsoft corporation" in file_content:
+                                return "azure"
+                            elif "google" in file_content:
+                                return "gcp"
+                    return "other"
+
+                try:
+                    statistics = try_vllm_check()
+                except Exception:
+                    statistics = "other"
+
     if statistics is not None:
         import tempfile
         from huggingface_hub import snapshot_download
@@ -1165,7 +1388,7 @@ def _get_statistics(statistics = None, force_download = True):
                     "model = FastLanguageModel.from_pretrained('unsloth/gpt-oss-20b')\n"
                     "```"
                 )
-            except:
+            except Exception:
                 # Try no time limit check
                 stats_check()
 
@@ -1178,7 +1401,10 @@ def get_statistics(local_files_only = False):
     # You can disable this by setting UNSLOTH_DISABLE_STATISTICS
     import os
 
-    if "UNSLOTH_DISABLE_STATISTICS" in os.environ:
+    if (
+        "UNSLOTH_DISABLE_STATISTICS" in os.environ
+        or os.environ.get("UNSLOTH_USE_MODELSCOPE", "0") == "1"
+    ):
         return
     if local_files_only:
         return
@@ -1621,6 +1847,20 @@ def _unsloth_pre_compute_loss(self, model, inputs, *args, **kwargs):
             "Using gradient accumulation will be very slightly less accurate.\n"
             "Read more on gradient accumulation issues here: https://unsloth.ai/blog/gradient"
         )
+    # Gemma3 multimodal models in transformers 5.x require token_type_ids during training.
+    # For text-only SFT, token_type_ids should be all zeros (no image tokens).
+    if "token_type_ids" not in inputs and "input_ids" in inputs:
+        _inner = model
+        for _attr in ("base_model", "model", "model"):
+            _inner = getattr(_inner, _attr, _inner)
+        if getattr(getattr(_inner, "config", None), "model_type", "") in ("gemma3",):
+            import sys as _sys
+
+            _mod = _sys.modules.get(type(_inner).__module__)
+            _has_ccm = _mod is not None and hasattr(_mod, "create_causal_mask_mapping")
+            if _has_ccm and _inner.training:
+                inputs["token_type_ids"] = torch.zeros_like(inputs["input_ids"])
+
     outputs = self._old_compute_loss(model, inputs, *args, **kwargs)
     return outputs
 
@@ -1688,60 +1928,103 @@ def patch_gradient_accumulation_fix(Trainer):
         )
 
     # Also fix up loss scaling ie negate loss *= self.args.gradient_accumulation_steps
-    if Trainer.training_step.__name__ == "_unsloth_training_step":
-        return
-    if "num_items_in_batch" not in inspect.signature(Trainer.training_step).parameters:
-        return
+    if not (
+        Trainer.training_step.__name__ == "_unsloth_training_step"
+        or "num_items_in_batch"
+        not in inspect.signature(Trainer.training_step).parameters
+    ):
+        function = inspect.getsource(Trainer.training_step)
+        where = function.find("def")
+        function = function.split("\n")
+        function = "\n".join(x[where:] for x in function)
 
-    function = inspect.getsource(Trainer.training_step)
-    where = function.find("def")
-    function = function.split("\n")
-    function = "\n".join(x[where:] for x in function)
+        # Import all variables that need importing
+        import transformers.trainer
 
-    # Import all variables that need importing
-    import transformers.trainer
+        items_in_trainer = dir(transformers.trainer)
+        good_items = []
+        for item in items_in_trainer:
+            if item in function:
+                good_items.append(item)
+        exec(
+            "from transformers.trainer import ("
+            + ", ".join(x for x in good_items)
+            + ")",
+            globals(),
+        )
 
-    items_in_trainer = dir(transformers.trainer)
-    good_items = []
-    for item in items_in_trainer:
-        if item in function:
-            good_items.append(item)
-    exec(
-        "from transformers.trainer import (" + ", ".join(x for x in good_items) + ")",
-        globals(),
-    )
+        # Accelerate does / self.args.gradient_accumulation_steps internally, so if we already
+        # summed it up and did the division before hand, we have to negate it.
+        function = function.replace(
+            "loss *= self.args.gradient_accumulation_steps",
+            "if num_items_in_batch is not None: loss *= self.args.gradient_accumulation_steps",
+        )
+        function = function.replace(
+            "def training_step", "def _unsloth_training_step", 1
+        )
 
-    # Accelerate does / self.args.gradient_accumulation_steps internally, so if we already
-    # summed it up and did the division before hand, we have to negate it.
-    function = function.replace(
-        "loss *= self.args.gradient_accumulation_steps",
-        "if num_items_in_batch is not None: loss *= self.args.gradient_accumulation_steps",
-    )
-    function = function.replace("def training_step", "def _unsloth_training_step", 1)
+        # Fix 4.47.0 issue where num_items_in_batch was removed
+        # See https://github.com/huggingface/transformers/pull/35121
+        function = function.replace(
+            "if self.model_accepts_loss_kwargs:",
+            "if False:",
+        )
 
-    # Fix 4.47.0 issue where num_items_in_batch was removed
-    # See https://github.com/huggingface/transformers/pull/35121
-    function = function.replace(
-        "if self.model_accepts_loss_kwargs:",
-        "if False:",
-    )
+        # Fix when num_items_in_batch is nothing
+        # https://github.com/huggingface/transformers/pull/35207
+        function = re.sub(
+            r"else:\n"
+            r"([\s]{4,})self\.accelerator\.backward\(loss, \*\*kwargs\)\n"
+            r"(.+?)if num_items_in_batch is None\:\n"
+            r"(.+?)return loss\.detach\(\) \/ self\.args\.gradient_accumulation_steps",
+            "else:\n"
+            "\2if num_items_in_batch is None:\n"
+            "\3loss = loss / self.args.gradient_accumulation_steps\n"
+            "\1self.accelerator.backward(loss, **kwargs)",
+            function,
+        )
 
-    # Fix when num_items_in_batch is nothing
-    # https://github.com/huggingface/transformers/pull/35207
-    function = re.sub(
-        r"else:\n"
-        r"([\s]{4,})self\.accelerator\.backward\(loss, \*\*kwargs\)\n"
-        r"(.+?)if num_items_in_batch is None\:\n"
-        r"(.+?)return loss\.detach\(\) \/ self\.args\.gradient_accumulation_steps",
-        "else:\n"
-        "\2if num_items_in_batch is None:\n"
-        "\3loss = loss / self.args.gradient_accumulation_steps\n"
-        "\1self.accelerator.backward(loss, **kwargs)",
-        function,
-    )
+        exec(function, globals())
+        Trainer.training_step = _unsloth_training_step
 
-    exec(function, globals())
-    Trainer.training_step = _unsloth_training_step
+    # Prevent double scaling gradient accumulation
+    # https://github.com/huggingface/transformers/pull/37208
+    # Patch model_accepts_loss_kwargs detection in Trainer.__init__
+    if Trainer.__init__.__name__ != "_unsloth___init__":
+        try:
+            init_function = inspect.getsource(Trainer.__init__)
+        except Exception:
+            init_function = ""
+        if init_function is not None:
+            init_function = textwrap.dedent(init_function)
+
+            # Import all variables that need importing
+            import transformers.trainer
+
+            items_in_trainer = dir(transformers.trainer)
+            good_items = []
+            for item in items_in_trainer:
+                if item in init_function:
+                    good_items.append(item)
+            exec(
+                "from transformers.trainer import ("
+                + ", ".join(x for x in good_items)
+                + ")",
+                globals(),
+            )
+
+            init_function = init_function.replace(
+                "def __init__", "def _unsloth___init__", 1
+            )
+
+            # Force else branch
+            init_function = re.sub(
+                r'if[\s]+hasattr\(\s*unwrapped_model\s*,\s*"accepts_loss_kwargs"\s*\)\s*:',
+                'if hasattr(unwrapped_model, "accepts_loss_kwargs") and False:',
+                init_function,
+            )
+            exec(init_function, globals())
+            Trainer.__init__ = _unsloth___init__
 
 
 def patch_tokenizer(model, tokenizer):
@@ -1810,6 +2093,12 @@ def unsloth_compile_transformers(
         return model_types, False
 
     supports_sdpa = [True]
+
+    # Run patches BEFORE compiler so class replacements (e.g. GptOssTopKRouter,
+    # GptOssExperts) are in place before the compiler caches references to them.
+    for temporary_patch in TEMPORARY_PATCHES:
+        temporary_patch()
+
     for model_type in model_types:
         _unsloth_compile_transformers(
             model_type,
@@ -1920,9 +2209,10 @@ def validate_loftq_config(loftq_config, lora_dropout, bias, init_lora_weights, m
         type(init_lora_weights) is bool
         or init_lora_weights == "gaussian"
         or init_lora_weights == "loftq"
+        or init_lora_weights == "corda"
     ):
         raise ValueError(
-            'Unsloth: `init_lora_weights` must be either [True, False, "gaussian", "loftq"].'
+            'Unsloth: `init_lora_weights` must be either [True, False, "gaussian", "loftq", "corda"].'
         )
 
     if init_lora_weights == "loftq":
@@ -2012,19 +2302,111 @@ except:
 
 @dataclass
 class TorchAOConfig:
-    qat_scheme: str = "int4"
-    base_config: AOBaseConfig = field(
-        default_factory = lambda: Int4WeightOnlyConfig(group_size = 128)
-    )
-    group_size: int = 128
-    filter_fn: Optional[Callable] = None
+    qat_scheme: Optional[str] = "int4"
 
-    def __post_init__(self):
-        if self.filter_fn is None:
-            self.filter_fn = (
+    # Each (config, filter_fn) pair defines a quantization rule
+    base_config_and_filter_fns: List[
+        Tuple["AOBaseConfig", Optional[Callable[[torch.nn.Module, str], bool]]]
+    ] = field(
+        default_factory = lambda: [
+            (
+                Int4WeightOnlyConfig(group_size = 128),
                 lambda m, _: isinstance(m, torch.nn.Linear)
-                and m.in_features >= self.group_size
-            )
+                and getattr(m, "in_features", 0) >= 128,
+            ),
+        ]
+    )
+
+    # Optional transformation to apply before quantization setup
+    prequantization_transform: Optional[Callable[[torch.nn.Module], None]] = None
+
+
+def _untie_input_output_embeddings(model: torch.nn.Module) -> None:
+    """
+    Utility to untie input/output embeddings in a HuggingFace model.
+    This is useful if we want to quantize the input/ouput embeddings differently.
+    Model is modified in-place.
+    """
+
+    # 1) Persist setting in config
+    if hasattr(model.config, "tie_word_embeddings"):
+        model.config.tie_word_embeddings = False
+
+    # 2) Find input and output embeddings
+    in_emb = model.get_input_embeddings()
+    out_proj = model.get_output_embeddings() or getattr(model, "lm_head", None)
+    if out_proj is None:
+        raise AttributeError("Couldn't locate output projection (lm_head).")
+
+    # (Optional) sanity: shapes should match [vocab, hidden]
+    assert (
+        out_proj.weight.shape == in_emb.weight.shape
+    ), f"Shape mismatch: out_proj {out_proj.weight.shape} vs in_emb {in_emb.weight.shape}"
+
+    # 3) Only clone if they are actually tied (shared storage)
+    if out_proj.weight.data_ptr() == in_emb.weight.data_ptr():
+        with torch.no_grad():
+            W = in_emb.weight.detach().clone()
+        out_proj.weight = torch.nn.Parameter(W)  # new storage, keeps dtype/device
+
+    # 4) Prevent future automatic re-tying
+    def _no_tie(self):
+        return
+
+    model.tie_weights = _no_tie.__get__(model, model.__class__)
+
+    # 5) Verify no shared storage
+    assert (
+        out_proj.weight.data_ptr() != in_emb.weight.data_ptr()
+    ), "Embeddings still tied!"
+
+
+def _filter_fn_to_fqns(
+    model: torch.nn.Module,
+    filter_fn: Callable[[torch.nn.Module, str], bool],
+) -> Iterator[str]:
+    """
+    Given a model and a filter function (m, fqn) -> bool,
+    yield fully qualified names (FQNs) of modules that match.
+    """
+    for fqn, module in model.named_modules():
+        if filter_fn(module, fqn):
+            yield fqn
+
+
+def _convert_torchao_model(model):
+    from transformers import TorchAoConfig
+    from torchao.quantization import quantize_, ModuleFqnToConfig
+    from torchao.quantization.qat import QATConfig
+    from torchao.utils import TorchAOBaseTensor
+
+    module_to_fqn_dict = {}
+    for base_config, filter_fn in model._torchao_config.base_config_and_filter_fns:
+        quantize_(model, QATConfig(base_config, step = "convert"), filter_fn = filter_fn)
+
+        # Default filter function used for quantize_
+        if filter_fn is None:
+            if "_default" in module_to_fqn_dict:
+                raise ValueError("Cannot use multiple default quantization configs")
+            module_to_fqn_dict["_default"] = base_config
+        else:
+            for fqn in _filter_fn_to_fqns(model, filter_fn):
+                if fqn in module_to_fqn_dict:
+                    raise ValueError(f"Found multiple quantization configs for {fqn}")
+                module_to_fqn_dict[fqn] = base_config
+
+    in_emb = model.get_input_embeddings()
+    out_proj = model.get_output_embeddings() or getattr(model, "lm_head", None)
+    kwargs = {}
+    if isinstance(in_emb.weight, TorchAOBaseTensor) or (
+        out_proj is not None and isinstance(out_proj.weight, TorchAOBaseTensor)
+    ):
+        kwargs["include_input_output_embeddings"] = True
+        kwargs["modules_to_not_convert"] = []
+
+    quant_config = ModuleFqnToConfig(module_to_fqn_dict)
+    quantization_config = TorchAoConfig(quant_type = quant_config, **kwargs)
+    model.config.quantization_config = quantization_config
 
 
 def _prepare_model_for_qat(
@@ -2040,64 +2422,117 @@ def _prepare_model_for_qat(
     QAT can be optionally combined with LoRA fine-tuning to for additional throughput improvement.
     For more details: https://dev-discuss.pytorch.org/t/speeding-up-qat-by-1-89x-with-lora/2700
     """
-    from torchao.quantization import PerRow, quantize_
-    from torchao.quantization.granularity import PerGroup
-    from torchao.quantization.qat import QATConfig
+    try:
+        from torchao.quantization import PerRow, quantize_
+        from torchao.quantization.granularity import PerGroup, PerAxis
+        from torchao.quantization.qat import QATConfig
+    except ImportError:
+        raise ImportError(TORCHAO_MSG)
+
+    # Gemma3 models have issues with int8 embedding quantization due to their
+    # large vocabulary size (262144). Auto-switch to int4 weight-only instead.
+    if qat_scheme == "int8-int4":
+        model_types = get_transformers_model_type(model.config)
+        is_gemma3 = any("gemma3" in mt or "gemma_3" in mt for mt in model_types)
+        if is_gemma3:
+            print(
+                "Unsloth: Gemma3 has a large vocabulary causing int8 embedding issues. "
+                "Switching to int4 weight-only QAT for training stability."
+            )
+            qat_scheme = "int4"
 
     if not isinstance(qat_scheme, TorchAOConfig):
-        filter_fn = None
-        group_size = None
-        base_config = None
+        torchao_config: Optional[TorchAOConfig] = None
         if qat_scheme == "fp8-int4":
-            from torchao.quantization import Float8DynamicActivationInt4WeightConfig
-
+            try:
+                from torchao.quantization import Float8DynamicActivationInt4WeightConfig
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
             group_size = 128
             base_config = Float8DynamicActivationInt4WeightConfig()
             filter_fn = (
                 lambda m, _: isinstance(m, torch.nn.Linear)
                 and m.in_features >= group_size
             )
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme,
+                base_config_and_filter_fns = [(base_config, filter_fn)],
+            )
         elif qat_scheme == "fp8-fp8":
-            from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
-
+            try:
+                from torchao.quantization import (
+                    Float8DynamicActivationFloat8WeightConfig,
+                )
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
             base_config = Float8DynamicActivationFloat8WeightConfig(
                 granularity = PerRow()
             )
-        elif qat_scheme == "int8-int4":
-            from torchao.quantization import Int8DynamicActivationIntxWeightConfig
-
-            group_size = 32
-            base_config = Int8DynamicActivationIntxWeightConfig(
-                weight_dtype = torch.int4, weight_granularity = PerGroup(group_size)
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme, base_config_and_filter_fns = [(base_config, None)]
             )
-            filter_fn = (
-                lambda m, _: isinstance(m, torch.nn.Linear)
-                and m.in_features >= group_size
+        elif qat_scheme == "int8-int4":
+            try:
+                from torchao.quantization import (
+                    Int8DynamicActivationIntxWeightConfig,
+                    IntxWeightOnlyConfig,
+                )
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme,
+                base_config_and_filter_fns = [
+                    (
+                        IntxWeightOnlyConfig(
+                            weight_dtype = torch.int8, granularity = PerAxis(0)
+                        ),
+                        lambda m, fqn: isinstance(m, torch.nn.Embedding),
+                    ),
+                    (
+                        Int8DynamicActivationIntxWeightConfig(
+                            weight_dtype = torch.int4, weight_granularity = PerGroup(32)
+                        ),
+                        None,
+                    ),
+                ],
+                prequantization_transform = _untie_input_output_embeddings,
             )
         elif qat_scheme == "int4":
-            from torchao.quantization import Int4WeightOnlyConfig
-
+            try:
+                from torchao.quantization import Int4WeightOnlyConfig
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
             group_size = 128
             base_config = Int4WeightOnlyConfig(group_size = group_size)
             filter_fn = (
                 lambda m, _: isinstance(m, torch.nn.Linear)
                 and m.in_features >= group_size
             )
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme,
+                base_config_and_filter_fns = [(base_config, filter_fn)],
+            )
+        elif qat_scheme == "int8":
+            try:
+                from torchao.quantization import IntxWeightOnlyConfig
+                from torchao.quantization.granularity import PerAxis
+            except ImportError:
+                raise ImportError(TORCHAO_MSG)
+
+            base_config = IntxWeightOnlyConfig(
+                weight_dtype = torch.int8,
+                granularity = PerAxis(0),
+            )
+            filter_fn = lambda m, _: isinstance(m, torch.nn.Linear)
+            torchao_config = TorchAOConfig(
+                qat_scheme = qat_scheme,
+                base_config_and_filter_fns = [(base_config, filter_fn)],
+            )
         else:
             raise ValueError(f"Unexpected QAT scheme {qat_scheme}")
-        # Save TorchAO schemes
-        torchao_config = TorchAOConfig(
-            qat_scheme = qat_scheme,
-            base_config = base_config,
-            group_size = group_size,
-            filter_fn = filter_fn,
-        )
+        assert torchao_config is not None, f"TorchAOConfig was not set for {qat_scheme}"
     else:
         torchao_config = qat_scheme
-        qat_scheme = torchao_config.qat_scheme
-        base_config = torchao_config.base_config
-        group_size = torchao_config.group_size
-        filter_fn = torchao_config.filter_fn
 
     # Save Torchao metadata everywhere
     inner_model = model
@@ -2105,8 +2540,12 @@ def _prepare_model_for_qat(
         inner_model._torchao_config = torchao_config
         inner_model = inner_model.model
     inner_model._torchao_config = torchao_config
-    # Quantize with TorchAO
-    quantize_(model, QATConfig(base_config, step = "prepare"), filter_fn = filter_fn)
+
+    if torchao_config.prequantization_transform is not None:
+        torchao_config.prequantization_transform(model)
+    for base_config, filter_fn in torchao_config.base_config_and_filter_fns:
+        quantize_(model, QATConfig(base_config, step = "prepare"), filter_fn = filter_fn)
+
     return model
 
 
@@ -2133,8 +2572,69 @@ def patch_hf_quantizer():
     except Exception as e:
         logger.warning(f"Failed to patch FbgemmFp8HfQuantizer. Error {e}")
 
+    try:
+        from transformers.quantizers.quantizer_torchao import TorchAoHfQuantizer
+
+        TorchAoHfQuantizer.is_trainable = property(make_trainable)
+        TorchAoHfQuantizer.is_qat_trainable = property(make_trainable)
+    except Exception as e:
+        logger.warning(f"Failed to patch TorchAoHfQuantizer. Error {e}")
+
 
 patch_hf_quantizer()
+
+
+def _redirect_fp8_to_bf16(
+    model_name, auto_config, load_in_fp8, token, trust_remote_code
+):
+    """
+    Detect FP8 quantization in model config and redirect to BF16 sibling.
+
+    Models shipping FP8 as default (e.g. mistralai/Ministral-3-*B-Instruct)
+    cannot be loaded with BNB 4-bit/8-bit or 16-bit mode. This detects
+    quant_method in ("fp8", "fbgemm_fp8") and redirects to {model_name}-BF16.
+
+    Redirect is SKIPPED when load_in_fp8 is truthy (True or 'block'),
+    meaning the user explicitly wants FP8 loading.
+
+    Returns (model_name, auto_config) -- possibly updated.
+    """
+    if not hasattr(auto_config, "quantization_config"):
+        return model_name, auto_config
+
+    _qc = auto_config.quantization_config
+    _qm = (
+        _qc.get("quant_method", "")
+        if isinstance(_qc, dict)
+        else getattr(_qc, "quant_method", "")
+    )
+    if _qm not in ("fp8", "fbgemm_fp8") or load_in_fp8:
+        return model_name, auto_config
+
+    _bf16_name = model_name.rstrip("/") + "-BF16"
+    _original_name = model_name
+    try:
+        from huggingface_hub import model_info as _hf_model_info
+        from transformers import AutoConfig
+
+        _hf_model_info(_bf16_name, token = token)
+        _bf16_config = AutoConfig.from_pretrained(
+            _bf16_name,
+            token = token,
+            trust_remote_code = trust_remote_code,
+        )
+        print(
+            f"Unsloth: {_original_name} uses FP8 weights. "
+            f"Redirecting to {_bf16_name}."
+        )
+        return _bf16_name, _bf16_config
+    except Exception:
+        raise RuntimeError(
+            f"Unsloth: {_original_name} uses FP8 weights but no BF16 version "
+            f"was found at {_bf16_name}.\n"
+            f"Loading FP8 weights with BitsAndBytes or in 16-bit will fail.\n"
+            f"Set load_in_fp8=True to use FP8 mode, or upload a BF16 version."
+        )
 
 
 def verify_fp8_support_if_applicable(model_config):
@@ -2143,14 +2643,223 @@ def verify_fp8_support_if_applicable(model_config):
         raise ValueError(
             f"Unsloth: FP8 quantization is only supported on CUDA GPUs. You are using {DEVICE_TYPE}."
         )
-    major_version, minor_version = torch.cuda.get_device_capability()
-    if quant_method == "fbgemm_fp8" and major_version < 9:
-        # While L4 does support FP8 as data type, it doesn't have fbgemm (package) support yet. So we restrict it.
-        raise ValueError(
-            f"Unsloth: FBGEMM FP8 quantization is only supported on H100 and higher GPUs. L4 is not supported. You are using {torch.cuda.get_device_name()}. Refer to https://developer.nvidia.com/cuda-gpus for more details."
+
+    # [TODO] Need to add FP8 support for Intel XPUs
+    if DEVICE_TYPE == "cuda":
+        major_version, minor_version = torch.cuda.get_device_capability()
+        if quant_method == "fbgemm_fp8" and major_version < 9:
+            # While L4 does support FP8 as data type, it doesn't have fbgemm (package) support yet. So we restrict it.
+            raise ValueError(
+                f"Unsloth: FBGEMM FP8 quantization is only supported on H100 and higher GPUs. L4 is not supported. You are using {torch.cuda.get_device_name()}. Refer to https://developer.nvidia.com/cuda-gpus for more details."
+            )
+        if quant_method == "fp8" and major_version * 10 + minor_version < 89:
+            # In case of block quantized, we allow L4 because we fall back to torchao kernels.
+            raise ValueError(
+                f"Unsloth: FP8 quantization is only supported on L4 and higher GPUs with compute capability 8.9 or higher. You are using {torch.cuda.get_device_name()}. Refer to https://developer.nvidia.com/cuda-gpus for more details."
+            )
+
+
+def _get_inference_mode_context_manager(model: torch.nn.Module):
+    """
+    If the state dict was quantized using torchao, we will run into
+    the following error when calling ops like aten.t() in inference mode.
+    This is a bug in PyTorch that affects all tensor subclasses.
+
+        Cannot set version_counter for inference tensor
+
+    For now, we work around this issue by using `torch.no_grad()` in this case.
+    See https://github.com/pytorch/pytorch/issues/164872 for more details.
+    Otherwise, just return `torch.inference_mode()`.
+    """
+    torchao_config = getattr(model, "torchao_config", None)
+    if torchao_config is not None and torchao_config.qat_scheme is None:
+        return torch.no_grad()
+    else:
+        return torch.inference_mode()
+
+
+def hf_login(token: Optional[str] = None) -> Optional[str]:
+    if token is None:
+        try:
+            from huggingface_hub import get_token
+
+            token = get_token()
+            if token is None:
+                return None
+        except:
+            return None
+    try:
+        from huggingface_hub import login
+
+        login(token = token)
+        return token
+    except Exception as e:
+        logger.info(f"Failed to login to huggingface using token with error: {e}")
+    return token
+
+
+# =============================================
+# MoE (Mixture of Experts) Detection and LoRA Utilities
+
+
+def is_moe_model(model) -> bool:
+    """
+    Detect if a model is a Mixture of Experts (MoE) model.
+
+    Args:
+        model: The model to check (can be HF model or config)
+
+    Returns:
+        True if the model is an MoE model, False otherwise
+    """
+    config = getattr(model, "config", model)
+
+    # Different MoE models use different config attribute names:
+    # - Qwen3-MoE: num_experts
+    # - GLM4-MoE: n_routed_experts, num_local_experts
+    # - Mixtral: num_local_experts
+    num_experts = None
+    for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+        num_experts = getattr(config, attr, None)
+        if num_experts is not None:
+            break
+
+    # Check text_config for VL models
+    if num_experts is None and hasattr(config, "text_config"):
+        for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+            num_experts = getattr(config.text_config, attr, None)
+            if num_experts is not None:
+                break
+
+    return num_experts is not None and num_experts > 0
+
+
+def get_moe_target_parameters(model, target_modules = None) -> Optional[List[str]]:
+    """
+    Get the target_parameters for MoE expert layers if applicable.
+
+    For MoE models, returns the parameter paths for expert weights
+    (gate_up_proj, down_proj) that should be targeted by PEFT's
+    target_parameters for LoRA on nn.Parameter.
+
+    Only includes MoE parameters that match what's in target_modules:
+    - If "down_proj" is in target_modules -> includes "mlp.experts.down_proj"
+    - If "gate_proj" or "up_proj" is in target_modules -> includes "mlp.experts.gate_up_proj"
+
+    Args:
+        model: The model to get target parameters for
+        target_modules: List/tuple of target module names to match against
+
+    Returns:
+        List of parameter paths for MoE experts, or None if not an MoE model
+    """
+    if not is_moe_model(model):
+        return None
+
+    config = getattr(model, "config", model)
+    # Get num_experts from various possible config attributes
+    num_experts = None
+    for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+        num_experts = getattr(config, attr, None)
+        if num_experts is not None:
+            break
+    if num_experts is None and hasattr(config, "text_config"):
+        for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+            num_experts = getattr(config.text_config, attr, None)
+            if num_experts is not None:
+                break
+    if num_experts is None:
+        num_experts = 0
+
+    # Determine which MoE parameters to include based on target_modules
+    moe_params = []
+
+    # Normalize target_modules to a set for efficient lookup
+    if target_modules is None:
+        # If no target_modules specified, include all MoE params
+        target_set = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+    elif isinstance(target_modules, str):
+        target_set = {target_modules}
+        # Heuristic for regex matching MLPs
+        if "proj" in target_modules and (
+            "mlp" in target_modules or "ffn" in target_modules
+        ):
+            target_set.update({"gate_proj", "up_proj", "down_proj", "gate_up_proj"})
+    else:
+        target_set = set(target_modules) if target_modules else set()
+
+    # gate_up_proj combines both gate_proj and up_proj in MoE
+    # Also match "gate_up_proj" directly since users may specify the fused name
+    if (
+        "gate_proj" in target_set
+        or "up_proj" in target_set
+        or "gate_up_proj" in target_set
+    ):
+        moe_params.append("mlp.experts.gate_up_proj")
+
+    if "down_proj" in target_set:
+        moe_params.append("mlp.experts.down_proj")
+
+    if moe_params:
+        print(
+            f"Unsloth: Detected MoE model with {num_experts = } and {target_modules = }. Enabling LoRA on MoE parameters: {moe_params}"
         )
-    if quant_method == "fp8" and major_version * 10 + minor_version < 89:
-        # In case of block quantized, we allow L4 because we fall back to torchao kernels.
-        raise ValueError(
-            f"Unsloth: FP8 quantization is only supported on L4 and higher GPUs with compute capability 8.9 or higher. You are using {torch.cuda.get_device_name()}. Refer to https://developer.nvidia.com/cuda-gpus for more details."
-        )
+        return moe_params
+
+    return None
+
+
+def make_fast_generate_wrapper(original_generate):
+    """
+    Creates a wrapper around model.generate that checks for incorrect
+    vLLM-style usage when fast_inference=False.
+    """
+
+    @functools.wraps(original_generate)
+    def _fast_generate_wrapper(*args, **kwargs):
+        # Check for vLLM-specific arguments
+        if "sampling_params" in kwargs:
+            raise ValueError(
+                "Unsloth: `sampling_params` is only supported when `fast_inference=True` (vLLM). "
+                "Since `fast_inference=False`, use HuggingFace generate arguments instead:\n"
+                "  model.fast_generate(**tokens.to('cuda'), max_new_tokens=64, temperature=1.0, top_p=0.95)"
+            )
+
+        if "lora_request" in kwargs:
+            raise ValueError(
+                "Unsloth: `lora_request` is only supported when `fast_inference=True` (vLLM). "
+                "Since `fast_inference=False`, LoRA weights are already merged into the model."
+            )
+
+        # Check if first positional argument is a string or list of strings
+        if len(args) > 0:
+            first_arg = args[0]
+            is_string_input = False
+
+            if isinstance(first_arg, str):
+                is_string_input = True
+            elif isinstance(first_arg, (list, tuple)) and len(first_arg) > 0:
+                if isinstance(first_arg[0], str):
+                    is_string_input = True
+
+            if is_string_input:
+                raise ValueError(
+                    "Unsloth: Passing text strings to `fast_generate` is only supported "
+                    "when `fast_inference=True` (vLLM). Since `fast_inference=False`, you must "
+                    "tokenize the input first:\n\n"
+                    "  messages = tokenizer.apply_chat_template(\n"
+                    '      [{"role": "user", "content": "Your prompt here"}],\n'
+                    "      tokenize=True, add_generation_prompt=True,\n"
+                    '      return_tensors="pt", return_dict=True\n'
+                    "  )\n"
+                    "  output = model.fast_generate(\n"
+                    "      **messages.to('cuda'),\n"
+                    "      max_new_tokens=64,\n"
+                    "      temperature=1.0,\n"
+                    "  )"
+                )
+
+        # Call original generate
+        return original_generate(*args, **kwargs)
+
+    return _fast_generate_wrapper

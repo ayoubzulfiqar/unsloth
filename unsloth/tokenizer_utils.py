@@ -25,6 +25,7 @@ import collections
 import numpy as np
 import gc
 import subprocess
+import psutil
 
 from unsloth_zoo.tokenizer_utils import (
     mean_of_trained_tokens,
@@ -600,8 +601,11 @@ def load_correct_tokenizer(
     ### 1. Fixup tokenizer's chat_template
     old_chat_template = getattr(tokenizer, "chat_template", None)
 
-    # Ignore mistral type models since they don't have a add_generation_prompt
-    if "mistral" in str(getattr(tokenizer, "name_or_path", "")).lower():
+    # Ignore mistral type models since they don't have an add_generation_prompt
+    if any(
+        s in str(getattr(tokenizer, "name_or_path", "")).lower()
+        for s in ["mistral", "qwen3guard"]
+    ):
         chat_template = old_chat_template
 
     # Also check Llama-2 old style models
@@ -1003,7 +1007,14 @@ def patch_sft_trainer_tokenizer():
             function = function.replace(replacer, check_text + replacer)
 
         x = [x for x in all_imports if x in function]
-        exec(f"from trl.trainer.sft_trainer import ({','.join(x)})", locals())
+        try:
+            exec(f"from trl.trainer.sft_trainer import ({','.join(x)})", locals())
+        except ImportError:
+            for _item in x:
+                try:
+                    exec(f"from trl.trainer.sft_trainer import {_item}", locals())
+                except ImportError:
+                    pass
         exec(function, locals(), globals())
         exec(
             f"trl.trainer.sft_trainer.SFTTrainer.{function_name} = {function_name}",
@@ -1017,7 +1028,10 @@ def patch_sft_trainer_tokenizer():
         "kto_trainer.KTOTrainer",
     ):
         function_name, replacer = "train", "if resume_from_checkpoint is False:"
-        function = getsource(eval(f"trl.trainer.{path_to_trainer}.{function_name}"))
+        try:
+            function = getsource(eval(f"trl.trainer.{path_to_trainer}.{function_name}"))
+        except Exception:
+            continue
         where = function.find("def")
         function = function.split("\n")
         function = "\n".join(x[where:] for x in function)

@@ -17,6 +17,17 @@ import os
 from ._utils import __version__
 from unsloth_zoo.utils import _get_dtype
 from unsloth_zoo.hf_utils import dtype_from_config
+from ..utils.packing import (
+    get_packed_info_from_kwargs,
+    mask_packed_sequence_boundaries,
+)
+from ..utils.attention_dispatch import (
+    AttentionConfig,
+    AttentionContext,
+    run_attention,
+    SDPA,
+    select_attention_backend,
+)
 from .llama import (
     LlamaRotaryEmbedding,
     LlamaLinearScalingRotaryEmbedding,
@@ -76,6 +87,7 @@ def MistralAttention_fast_forward(
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+    seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
@@ -83,12 +95,13 @@ def MistralAttention_fast_forward(
 
     # Extend RoPE dynamically to fit in VRAM
     self.rotary_emb.extend_rope_embedding(V, seq_len = kv_seq_len)
-
     cos, sin = self.rotary_emb.get_cached(kv_seq_len, Q.device.index)
-    if position_ids is None:
-        Q, K = fast_rope_embedding(Q, K, cos, sin)
-    else:
-        Q, K = inplace_rope_embedding(Q, K, cos, sin, position_ids)
+
+    rope_position_ids = (
+        position_ids if position_ids is not None else kwargs.get("position_ids")
+    )
+    # Useful for LongRoPE
+    Q, K = fast_rope_embedding(Q, K, cos, sin, rope_position_ids)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
@@ -96,68 +109,40 @@ def MistralAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    if not HAS_FLASH_ATTENTION and HAS_XFORMERS and attention_mask is None:
-        # Xformers memory efficient attention
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        K_M = V_M = bsz * kv_seq_len
-        Q_M = bsz * q_len
+    sw_cfg = getattr(self.config, "sliding_window", None)
+    sw = kv_seq_len if (sw_cfg is None or sw_cfg == "null") else sw_cfg
+    window_size = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
 
-        has_swa = isinstance(causal_mask, xformers.attn_bias.BlockDiagonalCausalMask)
+    use_varlen = (
+        seq_info is not None and past_key_value is None and window_size == (-1, -1)
+    )
+    backend = (
+        SDPA if attention_mask is not None else select_attention_backend(use_varlen)
+    )
+    attention_config = AttentionConfig(
+        backend = backend,
+        n_kv_heads = n_kv_heads,
+        n_groups = n_groups,
+        flash_dense_kwargs = {"causal": True, "window_size": window_size},
+        flash_varlen_kwargs = {
+            "dropout_p": 0.0,
+            "causal": True,
+            "softmax_scale": getattr(self, "softmax_scale", None),
+        },
+    )
+    context = AttentionContext(
+        bsz = bsz,
+        q_len = q_len,
+        kv_seq_len = kv_seq_len,
+        n_heads = n_heads,
+        head_dim = head_dim,
+        requires_grad = hidden_states.requires_grad,
+        seq_info = seq_info,
+        attention_mask = attention_mask,
+        causal_mask = causal_mask,
+    )
 
-        # Group query attention
-        K = K.view(bsz, kv_seq_len, n_kv_heads, 1, head_dim)
-        V = V.view(bsz, kv_seq_len, n_kv_heads, 1, head_dim)
-        K = K.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        V = V.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        if hidden_states.requires_grad:
-            K = K.reshape(bsz, kv_seq_len, n_heads, head_dim)
-            V = V.reshape(bsz, kv_seq_len, n_heads, head_dim)
-
-            if has_swa:
-                Q = Q.view(1, Q_M, n_heads, head_dim)
-                K = K.view(1, K_M, n_heads, head_dim)
-                V = V.view(1, V_M, n_heads, head_dim)
-        else:
-            # Xformers does support the forward pass though
-            Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
-
-            if has_swa:
-                Q = Q.view(1, Q_M, n_kv_heads, n_groups, head_dim)
-                K = K.view(1, K_M, n_kv_heads, n_groups, head_dim)
-                V = V.view(1, V_M, n_kv_heads, n_groups, head_dim)
-
-        A = xformers_attention(Q, K, V, attn_bias = causal_mask)
-        A = A.view(bsz, q_len, n_heads, head_dim)
-
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        sw = getattr(self.config, "sliding_window", None)
-        sw = kv_seq_len if (sw is None or sw == "null") else sw
-        window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
-        A = flash_attn_func(Q, K, V, causal = True, window_size = window)
-    else:
-        # Grouped query attention
-        # if n_groups != 1:
-        K = K[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        V = V[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        K = K.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        V = V.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        # pass
-        # Must be contiguous or else results are False!
-        # https://github.com/pytorch/pytorch/issues/112577
-        Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-        # Needs (batch_size, n_heads, seq_len, head_dim)
-        # is_casual and attention_mask must not be both set!
-        A = scaled_dot_product_attention(
-            Q, K, V, attn_mask = attention_mask, is_causal = False
-        )
-        # Go back to (batch_size, seq_len, n_heads, head_dim)
-        A = A.transpose(1, 2).contiguous()
-
+    A = run_attention(config = attention_config, context = context, Q = Q, K = K, V = V)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
@@ -234,13 +219,18 @@ def MistralForCausalLM_fast_forward(
                     bsz, 1, q_len, q_len
                 )
             else:
-                # attention_mask should be [bsz, 1, q_len, q_len] or broadcastable
-                # Add causal mask to existing attention mask
                 if attention_mask.dim() == 2:
-                    # [bsz, seq_len] -> [bsz, 1, 1, seq_len]
-                    attention_mask = attention_mask[:, None, None, :]
-                    attention_mask = attention_mask.expand(bsz, 1, q_len, q_len)
-                attention_mask = attention_mask + causal_mask_values[None, None, :, :]
+                    # Convert 0/1 padding mask to additive format: 1->0 (keep), 0->-inf (mask)
+                    padding_mask = torch.where(
+                        attention_mask[:, None, None, :].bool(),
+                        0.0,
+                        -torch.inf,
+                    )
+                    attention_mask = causal_mask_values[None, None, :, :] + padding_mask
+                else:
+                    attention_mask = (
+                        attention_mask + causal_mask_values[None, None, :, :]
+                    )
 
             attention_mask = attention_mask.to(
                 dtype = _get_dtype(dtype_from_config(self.config))
@@ -283,6 +273,7 @@ def MistralForCausalLM_fast_forward(
             output_attentions = output_attentions,
             output_hidden_states = output_hidden_states,
             return_dict = return_dict,
+            **kwargs,
         )
 
     hidden_states = outputs[0]
@@ -324,9 +315,9 @@ def MistralForCausalLM_fast_forward(
             RETURN_LOGITS = False
 
         if not RETURN_LOGITS and labels is not None:
-            n_items = kwargs.get("num_items_in_batch", None) or kwargs.get(
-                "n_items", None
-            )
+            n_items = kwargs.get("num_items_in_batch", None)
+            if n_items is None:
+                n_items = kwargs.get("n_items", None)
             logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
 
             # loss = fused_linear_cross_entropy(
@@ -376,11 +367,17 @@ def MistralForCausalLM_fast_forward(
         shift_labels = torch.empty_like(labels)
         shift_labels[..., :-1] = labels[..., 1:]
         shift_labels[..., -1] = -100
+        mask_packed_sequence_boundaries(
+            shift_labels,
+            kwargs.get("packed_seq_lengths"),
+        )
+        n_items = kwargs.get("num_items_in_batch", None)
+        if n_items is None:
+            n_items = kwargs.get("n_items", None)
         loss = fast_cross_entropy_loss(
             logits = shift_logits,
             labels = shift_labels,
-            n_items = kwargs.get("num_items_in_batch", None)
-            or kwargs.get("n_items", None),
+            n_items = n_items,
         )
 
     if not return_dict:
@@ -439,7 +436,7 @@ class FastMistralModel(FastLlamaModel):
 
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
-        # Inferene can now be CUDAGraphed, but we shall retain the old rotary embeddings.
+        # Inference can now be CUDAGraphed, but we shall retain the old rotary embeddings.
         # https://github.com/huggingface/transformers/pull/27931
         # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py
         import transformers.models.mistral.modeling_mistral
